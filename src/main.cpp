@@ -10,27 +10,17 @@
  *    - Шаговый двигатель NEMA17 через драйвер A4988 (AccelStepper, режим DRIVER):
  *      STEP=PA2, DIR=PA3, EN=PA4 (активный LOW)
  *    - Термистор NTC 100K B=3950 по пину PA0 (делитель с резистором 100 кОм)
- *    - Датчик диаметра нити (аналоговый): PA5
+ *    - Датчик диаметра нити (аналоговый): PA5 (вывод сырого АЦП D_RAW)
  *    - Светодиод аварийной индикации: PC13 (встроенный, инверсный: LOW = горит)
  *
  *  Команды Serial (115200 бод):
  *    T200  -> задать целевую температуру 200 °C
  *    S500  -> задать скорость мотора 500 шагов/сек
- *
- *  ----------------------------------------------------------------------------
- *  !!! ОБНОВЛЕНИЯ И ИСПРАВЛЕНИЯ !!!
- *    1) Медианная фильтрация (9 замеров) БЕЗ delayMicroseconds для максимальной
- *       быстродействия основного цикла loop().
- *    2) Мягкая защита термистора: кратковременные помехи (< 1 сек) игнорируются,
- *       используется последнее достоверное значение температуры.
- *    3) Безопасные настройки ПИД для 40 Вт нагревателя (Kp=10.0, Ki=0.5, Kd=20.0).
- *    4) Неблокирующая отправка отчета в Serial (Serial.availableForWrite())
- *       с краткой компактной формой вывода для исключения задержек loop().
- *    5) Аварийная светодиодная индикация на PC13:
- *       - 5 Гц мигание: фатальная ошибка термистора (обрыв/КЗ > 1 сек);
- *       - 2 Гц мигание: перегрев (> 285 °C);
- *       - ВЫКЛ (HIGH): нормальная работа.
- *    6) Заготовка для аналогового датчика диаметра нити (PA5) c выводом D=x.xxmm.
+ *    P10.0 -> изменить пропорциональный коэффициент ПИД Kp
+ *    I0.5  -> изменить интегральный коэффициент ПИД Ki
+ *    D20.0 -> изменить дифференциальный коэффициент ПИД Kd
+ *    STOP  -> экстренный останов (отключение нагрева и мотора до команды START)
+ *    START -> снятие блокировки после STOP
  * ============================================================================
  */
 
@@ -51,7 +41,7 @@
 #define PIN_STEPPING    PA2   // Цифровой выход: STEP драйвера A4988
 #define PIN_DIRECTION   PA3   // Цифровой выход: DIR драйвера A4988
 #define PIN_ENABLE      PA4   // Цифровой выход: EN драйвера A4988 (активный LOW)
-#define PIN_DIAMETER    PA5   // АЦП: датчик диаметра нити (датчик Холла/оптика)
+#define PIN_DIAMETER    PA5   // АЦП: сырой сигнал с датчика диаметра нити
 #define PIN_LED_STATUS  PC13  // Встроенный светодиод Blue Pill (активный LOW)
 
 // ============================================================================
@@ -63,18 +53,16 @@ const float    B_COEFF            = 3950.0f;   // B-коэффициент те�
 const float    NOMINAL_RESISTANCE = 100000.0f; // Сопротивление термистора при 25°C
 const float    NOMINAL_TEMP_C     = 25.0f;     // Эталонная температура (°C)
 
-// --- ПИД-константы (Безопасные настройки для нагревателя 40 Вт) --------------
-double Kp = 10.0;   // Пропорциональный коэффициент: умеренная реакция
-double Ki = 0.5;    // Интегральный коэффициент: плавное устранение статич. ошибки
-double Kd = 20.0;   // Дифференциальный коэффициент: гашение инерции/выбросов
-// -----------------------------------------------------------------------------
+// --- ПИД-константы (Изменяемые на лету через Serial) ------------------------
+double Kp = 10.0;   // Пропорциональный коэффициент
+double Ki = 0.5;    // Интегральный коэффициент
+double Kd = 20.0;   // Дифференциальный коэффициент
 
 // --- Температурные пороги и фильтрация ---------------------------------------
 #define TEMP_SETPOINT_DEFAULT  250.0   // Целевая температура по умолчанию, °C
 #define TEMP_MAX               285.0   // Аварийное отключение нагрева, °C
 #define TEMP_REENABLE          270.0   // Гистерезис защиты: при остывании ниже этой
-                                       // температуры нагрев автоматически включится
-                                       // снова (без "вечной" блокировки после выброса)
+                                       // температуры нагрев автоматически включится снова
 #define TEMP_HYSTERESIS        5.0     // Допусок ±5 °C для запуска мотора
 #define MOTOR_START_DELAY_MS   5000UL  // Задержка вращения после прогрева, мс
 #define SENSOR_ERROR_TIMEOUT_MS 1000UL // Допустимая длительность сбоя АЦП (1 сек)
@@ -87,9 +75,6 @@ double Kd = 20.0;   // Дифференциальный коэффициент: 
 
 // --- Half-cycle драйвер нагрева (основной режим, без таймеров) ---------------
 #define HEATER_CYCLE_MS        20UL    // Период "поулового" цикла, мс (50 Гц).
-                                       // Мощность = доля времени включения за цикл.
-                                       // Не использует НИ ОДИН таймер -> не конфликтует
-                                       // с AccelStepper/Systick.
 
 // ============================================================================
 // 3. СОСТОЯНИЕ СИСТЕМЫ (глобальные переменные)
@@ -97,13 +82,15 @@ double Kd = 20.0;   // Дифференциальный коэффициент: 
 double tempInput  = 0.0;    // Текущая измеренная температура, °C (вход ПИД)
 double tempOutput = 0.0;    // Выход ПИД: мощность нагрева 0..255
 double tempSetpoint = TEMP_SETPOINT_DEFAULT; // Целевая температура, °C
-float  filamentDiameter = 1.75f; // Текущий измеренный диаметр нити, мм
+uint16_t diameterRawAdc = 0; // Сырое значение АЦП с пина PA5
 
-bool  heaterEnabled   = true;  // Разрешение нагрева (сбрасывается при >TEMP_MAX
-                               // и восстанавливается при остывании <TEMP_REENABLE)
+bool  heaterEnabled   = true;  // Разрешение нагрева
 bool  thermalShutdown = false; // Флаг активного аварийного отключения по перегреву
-bool  motorRunning    = false; // Статус мотора для отчёта/логики
-bool  fatalSensorErr  = false; // Обрыв/КЗ термистора (latch до перезагрузки платы)
+bool  motorRunning    = false; // Запрошенный статус работы мотора
+bool  fatalSensorErr  = false; // Обрыв/КЗ термистора (> 1 сек)
+bool  systemStopped   = false; // Ручной блокирующий экстренный останов (по команде STOP)
+
+float motorTargetSpeed = 500.0f; // Заданная скорость мотора (шагов/сек)
 
 unsigned long lastReportMs   = 0; // Время последнего отчёта в Serial
 unsigned long heatOkSinceMs  = 0; // Момент входа температуры в допуск
@@ -124,27 +111,22 @@ bool          heaterPinState = false; // Актуальное состояние
 PID pid(&tempInput, &tempOutput, &tempSetpoint, Kp, Ki, Kd, DIRECT);
 
 // AccelStepper в режиме DRIVER: библиотека сама генерирует импульсы STEP
-// и управляет уровнем DIR. Микрошаги задаются перемычками MS1..MS3 на A4988.
+// и управляет уровнем DIR.
 AccelStepper stepper(AccelStepper::DRIVER, PIN_STEPPING, PIN_DIRECTION);
 
 // ============================================================================
-// 4. ИЗМЕРЕНИЕ ТЕМПЕРАТУРЫ И ДИАМЕТРА НИТИ
+// 4. ИЗМЕРЕНИЕ ТЕМПЕРАТУРЫ И ЧТЕНИЕ СЫРОГО АЦП ДИАМЕТРА (PA5)
 // ============================================================================
-/*
- * Медианный фильтр берёт ADC_SAMPLES_COUNT замеров подряда без искусственных delay Microseconds,
- * что занимает не более 10-15 мкс на 72 МГц STM32F1 и совершенно не задерживает loop().
- * При выходе АЦП в 0 или 4095 менее 1 сек используется последнее нормальное значение.
- */
 float readTemperatureCelsius()
 {
   uint16_t samples[ADC_SAMPLES_COUNT];
 
-  // 1. Быстрый набор серии замеров без задержек (занимает пару микросекунд на 72 МГц)
+  // 1. Быстрый набор серии замеров без задержек (10-15 мкс на 72 МГц)
   for (uint8_t i = 0; i < ADC_SAMPLES_COUNT; i++) {
     samples[i] = analogRead(PIN_THERMISTOR); // 12 бит: 0..4095
   }
 
-  // 2. Простая сортировка для выбора медианы
+  // 2. Медианная сортировка
   for (uint8_t i = 0; i < ADC_SAMPLES_COUNT - 1; i++) {
     for (uint8_t j = i + 1; j < ADC_SAMPLES_COUNT; j++) {
       if (samples[i] > samples[j]) {
@@ -155,29 +137,25 @@ float readTemperatureCelsius()
     }
   }
 
-  // Медианное значение АЦП
   uint16_t adcRaw = samples[ADC_SAMPLES_COUNT / 2];
 
   // 3. Мягкая обработка ошибок АЦП (КЗ -> 0, Обрыв -> >= 4095)
   if (adcRaw == 0 || adcRaw >= ADC_BITS_MAX) {
     unsigned long nowMs = millis();
     if (sensorErrorStartMs == 0) {
-      sensorErrorStartMs = nowMs; // Засекаем время начала сбоя
+      sensorErrorStartMs = nowMs;
     }
 
-    // Если сбой длится меньше SENSOR_ERROR_TIMEOUT_MS (1000 мс) — игнорируем помеху
     if (nowMs - sensorErrorStartMs < SENSOR_ERROR_TIMEOUT_MS) {
-      return lastValidTempC; // Возвращаем последнее заведомо правильное значение
+      return lastValidTempC; // Игнорируем кратковременную помеху
     } else {
-      // Сбой длится дольше 1 секунды -> фиксируем фатальную ошибку датчика
-      return -999.0f;
+      return -999.0f; // Фиксируем фатальную ошибку датчика (> 1 сек)
     }
   }
 
-  // Если АЦП выдал нормальное значение — сбрасываем таймер ошибки
   sensorErrorStartMs = 0;
 
-  // 4. Расчет сопротивления и температуры по формуле Стейнхарта-Харта
+  // 4. Расчет температуры по формуле Стейнхарта-Харта
   float rThermistor = SERIES_RESISTOR * (float)adcRaw /
                       (float)(ADC_BITS_MAX - adcRaw);
 
@@ -194,18 +172,11 @@ float readTemperatureCelsius()
 }
 
 /*
- * Чтение датчика диаметра нити на PA5 (датчик Холла / оптический датчик).
- * Перевод аналогового значения 0..4095 в диаметр в миллиметрах.
- * Калибровка: D (мм) = K * ADC + Offset (фиктивные коэффициенты для теста)
+ * Чтение сырого 12-битного значения АЦП с пина PA5 для сбора статистики калибровки.
  */
-float readDiameter()
+uint16_t readDiameterRaw()
 {
-  uint16_t adcRaw = analogRead(PIN_DIAMETER); // 12 бит: 0..4095
-
-  // Пример линейной калибровки: 2048 АЦП соответствует ~1.75 мм
-  // Формула: 1.0 мм + (adcRaw / 4095.0) * 1.5 мм -> диапазон 1.00..2.50 мм
-  float diameterMm = 1.00f + ((float)adcRaw / (float)ADC_BITS_MAX) * 1.50f;
-  return diameterMm;
+  return analogRead(PIN_DIAMETER); // 12 бит: 0..4095
 }
 
 // ============================================================================
@@ -264,39 +235,65 @@ void heaterEmergencyOff()
 }
 
 // ============================================================================
-// 6. СВЕТОДИОДНАЯ ИНДИКАЦИЯ ОШИБОК (PC13)
+// 6. УПРАВЛЕНИЕ ШАГОВЫМ ДВИГАТЕЛЕМ С ПЛАВНЫМ РАЗГОНОМ И ТОРМОЖЕНИЕМ
 // ============================================================================
 /*
- * Индикация состояния на встроенном LED (PC13, инверсная логика: LOW = горит):
- *   - Ошибка датчика (fatalSensorErr) -> Мигание 5 Гц (период 200 мс, half 100 мс)
- *   - Перегрев (thermalShutdown)     -> Мигание 2 Гц (период 500 мс, half 250 мс)
- *   - Норма (нет ошибок)             -> LED ВЫКЛ (HIGH)
+ * Плавный разгон и торможение через stepper.run() и stepper.moveTo().
+ * При включении мотора задается удаленная целевая позиция с ограничением maxSpeed.
+ * При выключении вызывается stepper.stop(), и мотор плавно останавливается.
+ * Пин EN активируется (LOW) при движении и отключается (HIGH) после полной остановки.
  */
+void updateStepperMotor()
+{
+  if (motorRunning && !fatalSensorErr && !thermalShutdown && !systemStopped) {
+    stepper.enableOutputs(); // EN = LOW (драйвер активен)
+    stepper.setMaxSpeed(motorTargetSpeed);
+
+    // Поддерживаем постоянную целевую позицию далеко впереди для непрерывного движения
+    if (stepper.distanceToGo() < 2000) {
+      stepper.moveTo(stepper.currentPosition() + 100000L);
+    }
+    stepper.run();
+  } else {
+    // Плавно замедляемся до полной остановки
+    stepper.stop();
+    stepper.run();
+
+    // Когда мотор полностью остановился (distanceToGo == 0) — снимаем питание с драйвера
+    if (stepper.distanceToGo() == 0) {
+      stepper.disableOutputs(); // EN = HIGH (драйвер обесточен)
+    }
+  }
+}
+
+// ============================================================================
+// 7. СВЕТОДИОДНАЯ ИНДИКАЦИЯ ОШИБОК (PC13)
+// ============================================================================
 void updateStatusLED(unsigned long nowMs)
 {
-  if (fatalSensorErr) {
-    // 5 Гц мигание (100 мс вкл / 100 мс выкл)
+  if (systemStopped || fatalSensorErr) {
+    // 5 Гц мигание (100 мс вкл / 100 мс выкл) — фатальный останов / ошибка датчика
     if (nowMs - lastLedBlinkMs >= 100UL) {
       lastLedBlinkMs = nowMs;
       ledState = !ledState;
-      digitalWrite(PIN_LED_STATUS, ledState ? LOW : HIGH); // LOW = LED ON
+      digitalWrite(PIN_LED_STATUS, ledState ? LOW : HIGH);
     }
   } else if (thermalShutdown) {
-    // 2 Гц мигание (250 мс вкл / 250 мс выкл)
+    // 2 Гц мигание (250 мс вкл / 250 мс выкл) — перегрев
     if (nowMs - lastLedBlinkMs >= 250UL) {
       lastLedBlinkMs = nowMs;
       ledState = !ledState;
-      digitalWrite(PIN_LED_STATUS, ledState ? LOW : HIGH); // LOW = LED ON
+      digitalWrite(PIN_LED_STATUS, ledState ? LOW : HIGH);
     }
   } else {
-    // Нормальный режим -> Светодиод выключен (HIGH)
+    // Норма — LED ВЫКЛ (HIGH)
     ledState = false;
     digitalWrite(PIN_LED_STATUS, HIGH);
   }
 }
 
 // ============================================================================
-// 7. КОМАНДЫ SERIAL: ПАРСИНГ "Txxx" (температура) и "Sxxx" (скорость)
+// 8. КОМАНДЫ SERIAL: T, S, P, I, D, STOP, START
 // ============================================================================
 String serialBuffer = "";
 
@@ -306,57 +303,115 @@ void handleSerialCommands()
     char c = (char)Serial.read();
 
     if (c == '\n' || c == '\r') {
+      serialBuffer.trim();
       if (serialBuffer.length() == 0) continue;
+
+      // 1. Команда STOP: Аварийная мгновенная блокировка всей системы
+      if (serialBuffer.equalsIgnoreCase("STOP")) {
+        systemStopped  = true;
+        heaterEnabled  = false;
+        heaterEmergencyOff();
+        motorRunning   = false;
+        stepper.stop();
+        Serial.println(F("=============================================="));
+        Serial.println(F("!!! EMERGENCY STOP ACTIVATED via Serial !!!"));
+        Serial.println(F("!!! Heater & Motor DISABLED. Send 'START' to reset. !!!"));
+        Serial.println(F("=============================================="));
+        serialBuffer = "";
+        continue;
+      }
+
+      // 2. Команда START: Снятие блокировки STOP
+      if (serialBuffer.equalsIgnoreCase("START")) {
+        if (systemStopped) {
+          systemStopped = false;
+          heaterEnabled = true;
+          Serial.println(F("[CMD] EMERGENCY STOP CLEARED. System re-armed."));
+        } else {
+          Serial.println(F("[CMD] System is already running."));
+        }
+        serialBuffer = "";
+        continue;
+      }
+
+      // Если система находится в блокировке STOP — отклоняем все остальные команды
+      if (systemStopped) {
+        Serial.println(F("[CMD] REJECTED: System is in EMERGENCY STOP! Send 'START' first."));
+        serialBuffer = "";
+        continue;
+      }
 
       char cmd = serialBuffer.charAt(0);
       String argStr = serialBuffer.substring(1);
+      argStr.trim();
+      double value = argStr.toDouble();
 
       if (cmd == 'T' || cmd == 't') {
-        long newTemp = argStr.toInt();
-        if (newTemp > 0 && newTemp <= (long)(TEMP_MAX - 5)) {
-          tempSetpoint = (double)newTemp;
-          Serial.print(F("[CMD] Set T="));
+        if (value > 0 && value <= (double)(TEMP_MAX - 5)) {
+          tempSetpoint = value;
+          Serial.print(F("[CMD] Set Target Temp: "));
           Serial.print(tempSetpoint, 1);
           Serial.println(F(" C"));
         } else {
-          Serial.println(F("[CMD] REJECTED: T out of range (1..280 C)"));
+          Serial.println(F("[CMD] REJECTED: Temp out of range (1..280 C)"));
         }
       } else if (cmd == 'S' || cmd == 's') {
-        long newSpeed = argStr.toInt();
-        if (newSpeed >= 0 && newSpeed <= 3000) {
-          stepper.setSpeed((float)newSpeed);
-          Serial.print(F("[CMD] Set speed="));
-          Serial.print(newSpeed);
-          Serial.println(F(" s/s"));
+        if (value >= 0 && value <= 3000) {
+          motorTargetSpeed = (float)value;
+          Serial.print(F("[CMD] Set Motor Target Speed: "));
+          Serial.print(motorTargetSpeed, 0);
+          Serial.println(F(" steps/s"));
         } else {
-          Serial.println(F("[CMD] REJECTED: speed out of range (0..3000)"));
+          Serial.println(F("[CMD] REJECTED: Speed out of range (0..3000)"));
+        }
+      } else if (cmd == 'P' || cmd == 'p') {
+        if (value >= 0.0) {
+          Kp = value;
+          pid.SetTunings(Kp, Ki, Kd);
+          Serial.print(F("[CMD] PID Kp updated: "));
+          Serial.println(Kp, 2);
+        }
+      } else if (cmd == 'I' || cmd == 'i') {
+        if (value >= 0.0) {
+          Ki = value;
+          pid.SetTunings(Kp, Ki, Kd);
+          Serial.print(F("[CMD] PID Ki updated: "));
+          Serial.println(Ki, 2);
+        }
+      } else if (cmd == 'D' || cmd == 'd') {
+        if (value >= 0.0) {
+          Kd = value;
+          pid.SetTunings(Kp, Ki, Kd);
+          Serial.print(F("[CMD] PID Kd updated: "));
+          Serial.println(Kd, 2);
         }
       } else {
-        Serial.println(F("[CMD] ERR: Unknown. Use T### or S###"));
+        Serial.println(F("[CMD] ERR: Unknown command. Use T, S, P, I, D, STOP, START"));
       }
 
       serialBuffer = "";
     } else {
       serialBuffer += c;
-      if (serialBuffer.length() > 16) serialBuffer = "";
+      if (serialBuffer.length() > 20) serialBuffer = "";
     }
   }
 }
 
 // ============================================================================
-// 8. ЛОГИКА БЕЗОПАСНОСТИ И УПРАВЛЕНИЯ МОТОРОМ
+// 9. ЛОГИКА БЕЗОПАСНОСТИ И УПРАВЛЕНИЯ
 // ============================================================================
 void safetyAndMotorControl(unsigned long nowMs)
 {
+  if (systemStopped) return; // Ручной экстренный останов имеет высший приоритет
+
   // --- Шаг 1. Неисправность датчика (длительностью более 1 секунды) ----------
   if (tempInput <= -900.0f) {
     if (!fatalSensorErr) {
       fatalSensorErr = true;
       heaterEnabled  = false;
       heaterEmergencyOff();
-      stepper.stop();
       motorRunning = false;
-      Serial.println(F("!!! SAFETY SHUTDOWN: SENSOR ERROR (>1s) !!!"));
+      Serial.println(F("!!! SAFETY SHUTDOWN: PERSISTENT SENSOR ERROR (>1s) !!!"));
     }
     return;
   } else if (fatalSensorErr) {
@@ -374,7 +429,6 @@ void safetyAndMotorControl(unsigned long nowMs)
       thermalShutdown = true;
       heaterEnabled   = false;
       heaterEmergencyOff();
-      stepper.stop();
       motorRunning  = false;
       heatOkSinceMs = 0;
       Serial.println(F("!!! SAFETY SHUTDOWN: OVERTEMPERATURE (>285 C) !!!"));
@@ -400,35 +454,28 @@ void safetyAndMotorControl(unsigned long nowMs)
 
     if (!motorRunning &&
         (nowMs - heatOkSinceMs) >= MOTOR_START_DELAY_MS) {
-      stepper.enableOutputs();
       motorRunning = true;
-      Serial.println(F("[MOTOR] ON"));
+      Serial.println(F("[MOTOR] STARTING - Temp at setpoint"));
     }
   } else {
     heatOkSinceMs = 0;
     if (motorRunning) {
-      stepper.disableOutputs();
       motorRunning = false;
-      Serial.println(F("[MOTOR] OFF"));
+      Serial.println(F("[MOTOR] STOPPING - Temp out of window"));
     }
   }
 }
 
 // ============================================================================
-// 9. НЕБЛОКИРУЮЩИЙ ВЫВОД ОТЧЕТА В SERIAL
+// 10. НЕБЛОКИРУЮЩИЙ ВЫВОД ОТЧЕТА В SERIAL (C Kp, Ki, Kd, D_RAW)
 // ============================================================================
-/*
- * Неблокирующий отчет: вызывается раз в секунду.
- * Для предотвращения задержек цикла loop() проверяется Serial.availableForWrite().
- * Вывод сделан максимально компактным (около 45-50 байт).
- */
 void printStatusReport(unsigned long nowMs)
 {
   if (nowMs - lastReportMs < REPORT_PERIOD_MS) return;
 
-  // Проверяем, есть ли достаточно места в буфере TX Serial (не менее 60 байт)
-  if (Serial.availableForWrite() < 60) {
-    return; // Пропускаем отчет в этот раз, чтобы не блокировать loop()
+  // Проверяем наличие места в буфере TX Serial (не менее 80 байт)
+  if (Serial.availableForWrite() < 80) {
+    return; // Не блокируем loop()
   }
 
   lastReportMs = nowMs;
@@ -439,12 +486,20 @@ void printStatusReport(unsigned long nowMs)
   Serial.print(tempSetpoint, 0);
   Serial.print(F("C PWM:"));
   Serial.print((int)tempOutput);
-  Serial.print(F(" D:"));
-  Serial.print(filamentDiameter, 2);
-  Serial.print(F("mm M:"));
+  Serial.print(F(" M:"));
   Serial.print(motorRunning ? "ON " : "OFF");
+  Serial.print(F(" | Kp:"));
+  Serial.print(Kp, 1);
+  Serial.print(F(" Ki:"));
+  Serial.print(Ki, 2);
+  Serial.print(F(" Kd:"));
+  Serial.print(Kd, 1);
+  Serial.print(F(" | D_RAW:"));
+  Serial.print(diameterRawAdc);
 
-  if (fatalSensorErr) {
+  if (systemStopped) {
+    Serial.println(F(" [EMERGENCY_STOP]"));
+  } else if (fatalSensorErr) {
     Serial.println(F(" [ERR:SENSOR]"));
   } else if (thermalShutdown) {
     Serial.println(F(" [ERR:OVERTEMP]"));
@@ -454,7 +509,7 @@ void printStatusReport(unsigned long nowMs)
 }
 
 // ============================================================================
-// 10. SETUP — ИНИЦИАЛИЗАЦИЯ ЖЕЛЕЗА И БИБЛИОТЕК
+// 11. SETUP — ИНИЦИАЛИЗАЦИЯ ЖЕЛЕЗА И БИБЛИОТЕК
 // ============================================================================
 void setup()
 {
@@ -462,8 +517,8 @@ void setup()
   delay(200);
   Serial.println(F("=============================================="));
   Serial.println(F(" PET EXTRUDER - STM32F103C8T6 (Blue Pill)"));
-  Serial.println(F(" Non-blocking Serial, LED PC13, PA5 Diameter"));
-  Serial.println(F(" Commands: T### = target temp C, S### = steps/s"));
+  Serial.println(F(" AccelStepper smooth acceleration, STOP/START, PID tuning"));
+  Serial.println(F(" Commands: T###, S###, P###, I###, D###, STOP, START"));
   Serial.println(F("=============================================="));
 
   // --- АЦП STM32: 12-битное разрешение ----------------------------------------
@@ -488,41 +543,43 @@ void setup()
   pid.SetSampleTime(PID_SAMPLE_TIME_S);
   pid.SetOutputLimits(0, 255);
 
-  // --- Шаговый двигатель (AccelStepper, режим DRIVER) ---------------------------
+  // --- Шаговый двигатель (AccelStepper с ускорением) ----------------------------
+  stepper.setEnablePin(PIN_ENABLE);
+  stepper.setPinsInverted(false, false, true); // EN пин активен LOW
   stepper.setMaxSpeed(3000.0);
-  stepper.setSpeed(500.0);
+  stepper.setAcceleration(2000.0); // Плавный разгон и торможение (шагов/сек^2)
+  stepper.disableOutputs();        // Обесточить моторы при старте
 
-  // --- Первое измерение температуры до входа в основной цикл --------------------
+  // --- Первое измерение температуры и АЦП диаметра -----------------------------
   tempInput = (double)readTemperatureCelsius();
-  filamentDiameter = readDiameter();
+  diameterRawAdc = readDiameterRaw();
 
   if (tempInput <= -900.0f) {
     Serial.println(F("[BOOT] WARN: thermistor open/short!"));
   } else {
     Serial.print(F("[BOOT] Temp: "));
     Serial.print(tempInput, 1);
-    Serial.print(F(" C | Diam: "));
-    Serial.print(filamentDiameter, 2);
-    Serial.println(F(" mm"));
+    Serial.print(F(" C | D_RAW: "));
+    Serial.println(diameterRawAdc);
   }
 }
 
 // ============================================================================
-// 11. LOOP — ОСНОВНОЙ ЦИКЛ
+// 12. LOOP — ОСНОВНОЙ ЦИКЛ
 // ============================================================================
 void loop()
 {
   unsigned long nowMs = millis();
 
-  // 1. Быстрое чтение термистора и датчика диаметра нити
+  // 1. Быстрое чтение термистора и сырого АЦП диаметра нити (PA5)
   tempInput = (double)readTemperatureCelsius();
-  filamentDiameter = readDiameter();
+  diameterRawAdc = readDiameterRaw();
 
   // 2. Обработка команд оператора из Serial
   handleSerialCommands();
 
   // 3. Расчёт ПИД: если нагрев разрешен — обновляем мощность
-  if (heaterEnabled && tempInput > -900.0f) {
+  if (heaterEnabled && !systemStopped && tempInput > -900.0f) {
     pid.Compute();
     heaterSet((int)tempOutput);
   } else {
@@ -530,19 +587,17 @@ void loop()
     heaterSet(0);
   }
 
-  // 4. Безопасность и логика включения/выключения мотора
+  // 4. Безопасность и логика разрешения работы мотора
   safetyAndMotorControl(nowMs);
 
   // 5. Вывод мощности на пин PA1 (half-cycle драйвер без таймеров)
   heaterDriver(nowMs);
 
-  // 6. Обновление светодиодной индикации ошибок на PC13 (5 Гц / 2 Гц)
-  updateStatusLED(nowMs);
+  // 6. Обновление работы шагового двигателя (плавный разгон/торможение)
+  updateStepperMotor();
 
-  // 7. Если мотор разрешён — крутим шаги (неблокирующий вызов)
-  if (motorRunning) {
-    stepper.runSpeed();
-  }
+  // 7. Обновление светодиодной индикации ошибок на PC13 (5 Гц / 2 Гц)
+  updateStatusLED(nowMs);
 
   // 8. Неблокирующий отчет в Serial (раз в секунду)
   printStatusReport(nowMs);
